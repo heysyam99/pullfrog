@@ -54,10 +54,15 @@ function canAccessExecutable(path: string): boolean {
 // attacker can bypass the filter by varying the case of GITHUB_WORKSPACE in
 // their injected PATH entry (`d:\a\repo` vs `D:\a\repo`).
 function normalizePathForCompare(path: string): string {
-  return process.platform === "win32" ? resolve(path).toLowerCase() : resolve(path);
+  return process.platform === "win32"
+    ? resolve(path).toLowerCase()
+    : resolve(path);
 }
 
-function isUntrustedPathEntry(entry: string, untrustedRoots: string[]): boolean {
+function isUntrustedPathEntry(
+  entry: string,
+  untrustedRoots: string[],
+): boolean {
   if (!isAbsolute(entry)) return true;
   const normalized = normalizePathForCompare(entry);
   for (const root of untrustedRoots) {
@@ -70,11 +75,15 @@ function isUntrustedPathEntry(entry: string, untrustedRoots: string[]): boolean 
 function getUntrustedPathRoots(env: NodeJS.ProcessEnv): string[] {
   const roots: string[] = [];
   const workspace = env.GITHUB_WORKSPACE;
-  if (workspace && isAbsolute(workspace)) roots.push(normalizePathForCompare(workspace));
+  if (workspace && isAbsolute(workspace))
+    roots.push(normalizePathForCompare(workspace));
   return roots;
 }
 
-function resolveExecutable(params: { command: string; env: NodeJS.ProcessEnv }): string | null {
+function resolveExecutable(params: {
+  command: string;
+  env: NodeJS.ProcessEnv;
+}): string | null {
   const pathValue = params.env.PATH ?? "";
   const untrustedRoots = getUntrustedPathRoots(params.env);
   const pathEntries = pathValue
@@ -88,7 +97,10 @@ function resolveExecutable(params: { command: string; env: NodeJS.ProcessEnv }):
 
   for (const pathEntry of pathEntries) {
     for (const extension of extensions) {
-      const candidate = join(pathEntry, `${params.command}${extension.toLowerCase()}`);
+      const candidate = join(
+        pathEntry,
+        `${params.command}${extension.toLowerCase()}`,
+      );
       if (canAccessExecutable(candidate)) {
         return candidate;
       }
@@ -114,7 +126,9 @@ function createRuntimeContext(): RuntimeContext {
   env.npm_config_min_release_age = "0";
   env.pnpm_config_minimum_release_age = "0";
   const currentPath = process.env.PATH ?? "";
-  env.PATH = currentPath ? `${nodeBinDir}${delimiter}${currentPath}` : nodeBinDir;
+  env.PATH = currentPath
+    ? `${nodeBinDir}${delimiter}${currentPath}`
+    : nodeBinDir;
 
   return {
     actionRef: process.env.GITHUB_ACTION_REF,
@@ -125,7 +139,11 @@ function createRuntimeContext(): RuntimeContext {
   };
 }
 
-function runCommand(params: { context: RuntimeContext; command: string; args: string[] }): void {
+function runCommand(params: {
+  context: RuntimeContext;
+  command: string;
+  args: string[];
+}): void {
   execFileSync(params.command, params.args, {
     cwd: process.env.GITHUB_WORKSPACE || params.context.actionRoot,
     stdio: "inherit",
@@ -143,33 +161,51 @@ function requireExecutable(params: {
   command: string;
   purpose: string;
 }): string {
-  const resolved = resolveExecutable({ command: params.command, env: params.context.env });
+  const resolved = resolveExecutable({
+    command: params.command,
+    env: params.context.env,
+  });
   if (!resolved) {
     throw new Error(
       `could not find ${params.command} on PATH (needed to ${params.purpose}); ` +
-        `runtime PATH was: ${params.context.env.PATH ?? "<empty>"}`
+        `runtime PATH was: ${params.context.env.PATH ?? "<empty>"}`,
     );
   }
   return resolved;
 }
 
-function runPackageCli(context: RuntimeContext, packageSpec: string, cliArgs: string[]): void {
+function runPackageCli(
+  context: RuntimeContext,
+  packageSpec: string,
+  cliArgs: string[],
+): void {
   const npxPath = resolveExecutable({ command: "npx", env: context.env });
   if (npxPath) {
-    runCommand({ context, command: npxPath, args: ["--yes", packageSpec, ...cliArgs] });
+    runCommand({
+      context,
+      command: npxPath,
+      args: ["--yes", packageSpec, ...cliArgs],
+    });
     return;
   }
 
-  const corepackPath = resolveExecutable({ command: "corepack", env: context.env });
+  const corepackPath = resolveExecutable({
+    command: "corepack",
+    env: context.env,
+  });
   if (corepackPath) {
     console.warn("» npx not found, using corepack pnpm dlx");
-    runCommand({ context, command: corepackPath, args: ["pnpm", "dlx", packageSpec, ...cliArgs] });
+    runCommand({
+      context,
+      command: corepackPath,
+      args: ["pnpm", "dlx", packageSpec, ...cliArgs],
+    });
     return;
   }
 
   throw new Error(
     `could not find npx or corepack on PATH to run ${packageSpec}; ` +
-      `runtime PATH was: ${context.env.PATH ?? "<empty>"}`
+      `runtime PATH was: ${context.env.PATH ?? "<empty>"}`,
   );
 }
 
@@ -186,21 +222,25 @@ function ensureActionDependencies(context: RuntimeContext): void {
   });
   const adjacentCorepack = join(
     context.nodeBinDir,
-    process.platform === "win32" ? "corepack.cmd" : "corepack"
+    process.platform === "win32" ? "corepack.cmd" : "corepack",
   );
   if (corepackPath !== adjacentCorepack) {
     // bad-runner case: GitHub's externals/node24/bin/ is missing the corepack
     // sibling, so we resolved via PATH instead. logging this lets us correlate
     // bootstrap path to runner pool when validating the fix.
     console.warn(
-      `» nodeBinDir corepack missing (${adjacentCorepack}); using PATH-resolved ${corepackPath}`
+      `» nodeBinDir corepack missing (${adjacentCorepack}); using PATH-resolved ${corepackPath}`,
     );
   }
-  execFileSync(corepackPath, ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"], {
-    cwd: context.actionRoot,
-    stdio: "inherit",
-    env: context.env,
-  });
+  execFileSync(
+    corepackPath,
+    ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"],
+    {
+      cwd: context.actionRoot,
+      stdio: "inherit",
+      env: context.env,
+    },
+  );
 }
 
 function runLocalCli(context: RuntimeContext, cliArgs: string[]): void {
@@ -218,7 +258,11 @@ function runPullfrogCliInner(context: RuntimeContext, cliArgs: string[]): void {
     return;
   }
 
-  if (context.actionRef === "main" && context.actionRepository === "pullfrog/pullfrog") {
+  if (
+    context.actionRef === "main" &&
+    (context.actionRepository === "pullfrog/pullfrog" ||
+      context.actionRepository === "heysyam99/pullfrog")
+  ) {
     runLocalCli(context, cliArgs);
     return;
   }
@@ -233,7 +277,9 @@ export function runPullfrogCli(params: RunPullfrogCliParams): void {
     try {
       runPullfrogCliInner(context, params.cliArgs);
     } catch (error) {
-      console.warn(`» pullfrog cleanup bootstrap failed: ${getErrorMessage(error)}`);
+      console.warn(
+        `» pullfrog cleanup bootstrap failed: ${getErrorMessage(error)}`,
+      );
       // best-effort cleanup
     }
     return;

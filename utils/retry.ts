@@ -25,14 +25,17 @@ const defaultShouldRetry = (error: unknown): boolean => {
   );
 };
 
-export async function retry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+export async function retry<T>(
+  fn: () => Promise<T>,
+  options: RetryOptions = {},
+): Promise<T> {
   const shouldRetry = options.shouldRetry ?? defaultShouldRetry;
   const label = options.label ?? "operation";
   const delays = options.delaysMs
     ? Array.from(options.delaysMs)
     : Array.from(
         { length: (options.maxAttempts ?? 3) - 1 },
-        (_, i) => (options.delayMs ?? 1000) * (i + 1)
+        (_, i) => (options.delayMs ?? 1000) * (i + 1),
       );
   const maxAttempts = delays.length + 1;
 
@@ -49,7 +52,9 @@ export async function retry<T>(fn: () => Promise<T>, options: RetryOptions = {})
       }
 
       const delay = delays[attempt - 1]!;
-      log.info(`» ${label} failed (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms...`);
+      log.info(
+        `» ${label} failed (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms...`,
+      );
       await sleep(delay);
     }
   }

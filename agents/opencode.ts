@@ -11,23 +11,21 @@
  * the agent process itself gets full env (needs LLM API keys, PATH, etc.).
  * security is enforced at the tool layer, not the process layer.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
-import * as core from "@actions/core";
+import { setTimeout as sleep } from "node:timers/promises";
 import { pullfrogMcpName } from "../external.ts";
-import { BEDROCK_MODEL_ID_ENV } from "../models.ts";
+import { BEDROCK_MODEL_ID_ENV, modelAliases } from "../models.ts";
 import type { ToolState } from "../toolState.ts";
+import { getIdleMs, markActivity } from "../utils/activity.ts";
 import {
-  getIdleMs,
-  isActivitySuspended,
-  markActivity,
-  resumeActivity,
-  suspendActivity,
-} from "../utils/activity.ts";
-import { type AgentDiagnostic, formatAgentHangBody } from "../utils/agentHangReport.ts";
+  type AgentDiagnostic,
+  formatAgentHangBody,
+} from "../utils/agentHangReport.ts";
 import { formatJsonValue, log } from "../utils/cli.ts";
-import { installCodexAuth } from "../utils/codexHome.ts";
+import { installFromNpmTarball } from "../utils/install.ts";
 import { findProviderErrorMatch } from "../utils/providerErrors.ts";
 import { addSkill, installBundledSkills } from "../utils/skills.ts";
 import {
@@ -40,26 +38,21 @@ import {
 import { ThinkingTimer } from "../utils/timer.ts";
 import type { TodoTracker } from "../utils/todoTracking.ts";
 import { getDevDependencyVersion } from "../utils/version.ts";
-import { resolveVertexOpenCodeModel } from "../utils/vertex.ts";
 import {
   PULLFROG_BUS_EVENT_TYPE,
   PULLFROG_OPENCODE_PLUGIN_FILENAME,
   PULLFROG_OPENCODE_PLUGIN_SOURCE,
 } from "./opencodePlugin.ts";
 import {
-  autoSelectModel,
-  buildReviewerAgentConfig,
-  geminiHighThinkingOverrides,
-  installOpencodeCli,
-  type OpenCodeConfig,
-} from "./opencodeShared.ts";
-import {
   buildLearningsReflectionPrompt,
   runPostRunRetryLoop,
-  shouldRunReflection,
 } from "./postRun.ts";
-import { REVIEWER_AGENT_NAME } from "./reviewer.ts";
-import { formatWithLabel, ORCHESTRATOR_LABEL, SessionLabeler } from "./sessionLabeler.ts";
+import { REVIEWER_AGENT_NAME, REVIEWER_SYSTEM_PROMPT } from "./reviewer.ts";
+import {
+  formatWithLabel,
+  ORCHESTRATOR_LABEL,
+  SessionLabeler,
+} from "./sessionLabeler.ts";
 import {
   type AgentResult,
   type AgentRunContext,
@@ -68,13 +61,29 @@ import {
   logTokenTable,
   MAX_STDERR_LINES,
 } from "./shared.ts";
+import { deriveSubagentModels } from "./subagentModels.ts";
 
-// re-export for the existing test (`./opencode.test.ts`) — once v1 is
-// retired this module collapses and the test imports from opencodeShared.
-export { geminiHighThinkingOverrides } from "./opencodeShared.ts";
+async function installOpencodeCli(): Promise<string> {
+  return await installFromNpmTarball({
+    packageName: "opencode-ai",
+    version: getDevDependencyVersion("opencode-ai"),
+    executablePath: "bin/opencode",
+    installDependencies: true,
+  });
+}
 
-// v1.4-era npm package shipped a per-platform binary directly at this path.
-const installCli = () => installOpencodeCli({ binPath: "bin/opencode" });
+// ── config ─────────────────────────────────────────────────────────────────────
+
+type OpenCodeConfig = {
+  mcp?: Record<string, unknown>;
+  permission?: Record<string, unknown>;
+  provider?: Record<string, unknown>;
+  agent?: Record<string, unknown>;
+  experimental?: Record<string, unknown>;
+  model?: string;
+  enabled_providers?: string[];
+  [key: string]: unknown;
+};
 
 // NOTE: OpenCode's per-call `max_tokens` defaults to 32_000. We previously
 // overrode this via `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX = 5000` in #616
@@ -96,7 +105,33 @@ const installCli = () => installOpencodeCli({ binPath: "bin/opencode" });
 // top-level `limit.output` config field has no read site (silently dropped
 // on merge in session/llm.ts), so the env var is the only working knob.
 
-function buildSecurityConfig(ctx: AgentRunContext, model: string | undefined): string {
+/**
+ * upstream opencode hardcodes `thinkingLevel: "high"` as the default for every
+ * gemini-3 model on the direct google SDK (`provider/transform.ts` `options()`).
+ * that adds 30-60s of pre-tool-call TTFT and 5-46s of post-tool jabber per turn,
+ * which is overkill for agentic loops where most steps are tool-routing
+ * decisions. we override to "medium" for the curated slugs we ship in
+ * `action/models.ts`; users who want max quality can still pick the `-high`
+ * variant explicitly. flash stays at "medium" too — low-effort flash is
+ * visibly worse on harder tasks and the latency savings aren't meaningful
+ * (flash is already fast). other gemini-3 ids that exist in models.dev but
+ * aren't in our curated alias map keep the upstream `"high"` default.
+ *
+ * keyed by upstream api id (matches the slugs in `action/models.ts`). the
+ * merge order in opencode `session/llm.ts` is `base ← model.options ← agent.options ← variant`,
+ * deep-merged — so an explicit `--variant high` still wins, and explicit
+ * model.options in a user-provided opencode config would also win.
+ */
+const GEMINI_3_DIRECT_THINKING_LEVEL = "medium";
+const GEMINI_3_DIRECT_API_IDS = [
+  "gemini-3.1-pro-preview",
+  "gemini-3-flash-preview",
+];
+
+function buildSecurityConfig(
+  ctx: AgentRunContext,
+  model: string | undefined,
+): string {
   const config: OpenCodeConfig = {
     permission: {
       bash: "deny",
@@ -111,26 +146,84 @@ function buildSecurityConfig(ctx: AgentRunContext, model: string | undefined): s
     },
     agent: (() => {
       const cfg = buildReviewerAgentConfig(model);
-      const reviewerModel = (cfg[REVIEWER_AGENT_NAME] as { model?: string })?.model ?? "(inherit)";
+      const reviewerModel =
+        (cfg[REVIEWER_AGENT_NAME] as { model?: string })?.model ?? "(inherit)";
       log.info(`» subagent models: reviewfrog=${reviewerModel}`);
       return cfg;
     })(),
-    // NOTE: `experimental.batch_tool` was enabled in #719 to bundle 1-25
-    // independent tool calls into one round trip, but the batch tool rejects
-    // MCP/"external" tools with `"Tool '<name>' not in registry. External
-    // tools (MCP, environment) cannot be batched - call them directly."`
-    // (anomalyco/opencode PR #2983 design). when a model emits parallel
-    // tool_use blocks containing `pullfrog_*` calls, opencode internally
-    // routes them through batch — they all fail, the model misreads the
-    // error as "the tool doesn't exist", and gives up. caught in CI by
-    // `restricted-opencode` after a `lens:` subagent dispatched parallel
-    // `pullfrog_shell` calls and concluded shell was unavailable.
-    // native parallel tool_use (multiple tool_use blocks per assistant
-    // message) still works without batch_tool for both built-in and MCP
-    // tools, so we lose only the batch wrapper, not parallelism.
-    // gemini-3 thinking pinned to high for review depth; gpt and anthropic
-    // effort set elsewhere (gpt: upstream default, anthropic: --effort flag in claude.ts).
-    provider: { google: { models: geminiHighThinkingOverrides() } },
+    // opt into opencode's experimental `batch` tool (added in
+    // anomalyco/opencode PR #2983, opt-in via `experimental.batch_tool`). it
+    // exposes a single `batch` tool that runs 1-25 independent tool calls
+    // (read/grep/glob/bash/etc.) concurrently in one assistant turn, which
+    // collapses the dominant grep→20×read pattern into a single round trip.
+    // edits are explicitly disallowed inside the batch upstream. paired with
+    // the "Parallel tool execution" guidance in utils/instructions.ts so the
+    // model actually reaches for it. see wiki/prompt.md.
+    experimental: { batch_tool: true },
+    provider: {
+      ...(process.env.CUSTOM_OPENAI_API_KEY
+        ? {
+            openai: {
+              base_url:
+                process.env.CUSTOM_OPENAI_BASE_URL ||
+                "https://api.openai.com/v1",
+              api_key: process.env.CUSTOM_OPENAI_API_KEY,
+            },
+          }
+        : {}),
+      ...(process.env.CROFAI_API_KEY
+        ? {
+            crofai: {
+              id: "crofai",
+              name: "CrofAI",
+              api: process.env.CROFAI_BASE_URL || "https://crof.ai/v1",
+              npm: "@ai-sdk/openai-compatible",
+              env: ["CROFAI_API_KEY"],
+              options: process.env.CROFAI_REASONING_EFFORT
+                ? { reasoning_effort: process.env.CROFAI_REASONING_EFFORT }
+                : undefined,
+              models: (() => {
+                const crofaiModel = model?.startsWith("crofai/")
+                  ? model.slice(7)
+                  : undefined;
+                return crofaiModel
+                  ? {
+                      [crofaiModel]: {
+                        id: crofaiModel,
+                        name: crofaiModel,
+                        status: "active",
+                        temperature: true,
+                        reasoning: !!process.env.CROFAI_REASONING_EFFORT,
+                        tool_call: true,
+                        modalities: { input: ["text"], output: ["text"] },
+                        limit: { context: 128000, output: 16384 },
+                        provider: {
+                          npm: "@ai-sdk/openai-compatible",
+                          api:
+                            process.env.CROFAI_BASE_URL || "https://crof.ai/v1",
+                        },
+                      },
+                    }
+                  : undefined;
+              })(),
+            },
+          }
+        : {}),
+      google: {
+        models: Object.fromEntries(
+          GEMINI_3_DIRECT_API_IDS.map((id) => [
+            id,
+            {
+              options: {
+                thinkingConfig: {
+                  thinkingLevel: GEMINI_3_DIRECT_THINKING_LEVEL,
+                },
+              },
+            },
+          ]),
+        ),
+      },
+    },
   };
 
   if (model) {
@@ -143,6 +236,99 @@ function buildSecurityConfig(ctx: AgentRunContext, model: string | undefined): s
   }
 
   return JSON.stringify(config);
+}
+
+/**
+ * Read-only `reviewfrog` subagent for lens-based review.
+ *
+ * Non-mutative + non-recursive — enforced by the prose system prompt in
+ * reviewer.ts.
+ *
+ * Per-subagent `model:` override is driven by the registry in
+ * `action/models.ts` via each alias's `subagentModel` field — see
+ * `deriveSubagentModels` for the reverse-lookup. Currently wired:
+ * Anthropic opus → sonnet, OpenAI gpt-pro → gpt and gpt → gpt-5.4,
+ * Google gemini-pro → gemini-flash. Other providers (xai, deepseek,
+ * moonshot) and already-cheap tiers inherit (no override) — either the
+ * absolute savings are too small to justify or there's no clean
+ * cheaper-but-capable sibling.
+ */
+function buildReviewerAgentConfig(
+  orchestratorModel: string | undefined,
+): Record<string, unknown> {
+  const overrides = deriveSubagentModels(orchestratorModel);
+  return {
+    [REVIEWER_AGENT_NAME]: {
+      description:
+        "Read-only review subagent for lens-based code review (correctness, security, billing-subsystem, etc.). " +
+        "Reads only — no writes, no state-changing shell or MCP calls, no nested subagent dispatch.",
+      mode: "subagent",
+      prompt: REVIEWER_SYSTEM_PROMPT,
+      ...(overrides.reviewer !== undefined
+        ? { model: overrides.reviewer }
+        : {}),
+    },
+  };
+}
+
+// ── model auto-select fallback ──────────────────────────────────────────────────
+//
+// steps 1–2 of model resolution (PULLFROG_MODEL env, slug resolution) are handled
+// by resolveModel() in utils/agent.ts before the agent runs. this fallback only
+// handles step 3: auto-select via `opencode models`.
+
+function getOpenCodeModels(cliPath: string): string[] {
+  try {
+    const output = execFileSync(cliPath, ["models"], {
+      encoding: "utf-8",
+      timeout: 30_000,
+      env: process.env,
+    });
+    return output
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch (error) {
+    log.debug(
+      `» failed to run \`opencode models\`: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return [];
+  }
+}
+
+const AUTO_SELECT_WARNING =
+  "select a model explicitly in the Pullfrog console (https://pullfrog.com/console) to avoid this.";
+
+function autoSelectModel(cliPath: string): string | undefined {
+  const availableModels = getOpenCodeModels(cliPath);
+  const availableSet = new Set(availableModels);
+  if (availableSet.size > 0) {
+    log.debug(
+      `» opencode models (${availableSet.size}): ${availableModels.join(", ")}`,
+    );
+    // skip hidden aliases (internal subagent-tier targets like opencode/gpt-5.4) —
+    // they should never surface as a user-facing orchestrator pick. mirrors the
+    // selectable-list filter in components/ModelSelector.tsx and action/commands/init.ts.
+    const match =
+      modelAliases.find(
+        (a) => !a.hidden && a.preferred && availableSet.has(a.resolve),
+      ) ?? modelAliases.find((a) => !a.hidden && availableSet.has(a.resolve));
+    if (match) {
+      log.info(
+        `» model: ${match.resolve} (auto-selected${match.preferred ? " — preferred" : ""} curated match)`,
+      );
+      log.warning(`» model auto-selected. ${AUTO_SELECT_WARNING}`);
+      return match.resolve;
+    }
+    log.info(
+      `» opencode has ${availableSet.size} models but none match curated aliases — letting OpenCode auto-select`,
+    );
+  }
+
+  log.warning(
+    `» no model resolved. letting OpenCode auto-select. ${AUTO_SELECT_WARNING}`,
+  );
+  return undefined;
 }
 
 // ── NDJSON event types ─────────────────────────────────────────────────────────
@@ -319,7 +505,9 @@ type RunParams = {
   toolState: ToolState;
   todoTracker?: TodoTracker | undefined;
   onActivityTimeout?: (() => void) | undefined;
-  onToolUse?: ((event: { toolName: string; input: unknown }) => void) | undefined;
+  onToolUse?:
+    | ((event: { toolName: string; input: unknown }) => void)
+    | undefined;
 };
 
 async function runOpenCode(params: RunParams): Promise<AgentResult> {
@@ -336,7 +524,11 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
   const toolCallTimings = new Map<string, number>();
   let currentStepId: string | null = null;
   let currentStepType: string | null = null;
-  let stepHistory: Array<{ stepId: string; stepType: string; toolCalls: string[] }> = [];
+  let stepHistory: Array<{
+    stepId: string;
+    stepType: string;
+    toolCalls: string[];
+  }> = [];
 
   // per-session labeler so parallel subagent log lines can be differentiated.
   // the orchestrator's task tool_use events seed the labeler; the next
@@ -353,7 +545,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
     return labeler.labelFor(typeof sid === "string" ? sid : null);
   }
   function withLabel(label: string, message: string): string {
-    return label === ORCHESTRATOR_LABEL ? message : formatWithLabel(label, message);
+    return label === ORCHESTRATOR_LABEL
+      ? message
+      : formatWithLabel(label, message);
   }
 
   // one ThinkingTimer per session — sharing a single timer across sessions
@@ -403,15 +597,16 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
     dispatch: TaskDispatch,
     status: string,
     output: unknown,
-    matchKind: "exact" | "fifo"
+    matchKind: "exact" | "fifo",
   ) {
     const subagentDuration = performance.now() - dispatch.startedAt;
     const outputStr = typeof output === "string" ? output : "";
-    const outputPreview = outputStr.length > 120 ? `${outputStr.slice(0, 120)}…` : outputStr;
+    const outputPreview =
+      outputStr.length > 120 ? `${outputStr.slice(0, 120)}…` : outputStr;
     const matchSuffix = matchKind === "fifo" ? " [fifo-matched]" : "";
     log.info(
       `» subagent finished: ${dispatch.label} (${(subagentDuration / 1000).toFixed(1)}s, status=${status})${matchSuffix}` +
-        (outputPreview ? ` — ${outputPreview.replace(/\n/g, " ")}` : "")
+        (outputPreview ? ` — ${outputPreview.replace(/\n/g, " ")}` : ""),
     );
     taskDispatchByCallID.delete(dispatch.toolUseCallID);
     const idx = pendingTaskDispatches.indexOf(dispatch);
@@ -420,7 +615,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
 
   function buildUsage(): AgentUsage | undefined {
     const totalInput =
-      accumulatedTokens.input + accumulatedTokens.cacheRead + accumulatedTokens.cacheWrite;
+      accumulatedTokens.input +
+      accumulatedTokens.cacheRead +
+      accumulatedTokens.cacheWrite;
     return totalInput > 0 || accumulatedTokens.output > 0
       ? {
           agent: "pullfrog",
@@ -443,20 +640,32 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       log.debug(
         withLabel(
           label,
-          `» ${params.label} init: session_id=${event.session_id || "unknown"}, model=${event.model || "unknown"}`
-        )
+          `» ${params.label} init: session_id=${event.session_id || "unknown"}, model=${event.model || "unknown"}`,
+        ),
       );
-      log.debug(withLabel(label, `» ${params.label} init event (full): ${JSON.stringify(event)}`));
+      log.debug(
+        withLabel(
+          label,
+          `» ${params.label} init event (full): ${JSON.stringify(event)}`,
+        ),
+      );
       // only reset run-wide state on the orchestrator's init — child sessions
       // emit their own init events and we don't want them to clobber the
       // parent's accumulated counters.
       if (label === ORCHESTRATOR_LABEL) {
         finalOutput = "";
-        accumulatedTokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+        accumulatedTokens = {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+        };
         accumulatedCostUsd = 0;
         tokensLogged = false;
       } else {
-        log.info(`» ${params.label} subagent init: ${label} (session ${event.session_id || "?"})`);
+        log.info(
+          `» ${params.label} subagent init: ${label} (session ${event.session_id || "?"})`,
+        );
       }
     },
     message: (event: OpenCodeMessageEvent) => {
@@ -467,15 +676,15 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
           log.debug(
             withLabel(
               label,
-              `» ${params.label} thinking: ${message.substring(0, 300)}${message.length > 300 ? "..." : ""}`
-            )
+              `» ${params.label} thinking: ${message.substring(0, 300)}${message.length > 300 ? "..." : ""}`,
+            ),
           );
         } else {
           log.debug(
             withLabel(
               label,
-              `» ${params.label} message (${event.role}): ${message.substring(0, 100)}${message.length > 100 ? "..." : ""}`
-            )
+              `» ${params.label} message (${event.role}): ${message.substring(0, 100)}${message.length > 100 ? "..." : ""}`,
+            ),
           );
           // same reasoning as `text` handler — only orchestrator's non-delta
           // assistant message is the run output; subagent reports stay scoped
@@ -488,8 +697,8 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
         log.debug(
           withLabel(
             label,
-            `» ${params.label} message (${event.role}): ${event.content?.substring(0, 100) || ""}${event.content && event.content.length > 100 ? "..." : ""}`
-          )
+            `» ${params.label} message (${event.role}): ${event.content?.substring(0, 100) || ""}${event.content && event.content.length > 100 ? "..." : ""}`,
+          ),
         );
       }
     },
@@ -497,7 +706,10 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       if (event.part?.text?.trim()) {
         const message = event.part.text.trim();
         const label = eventLabel(event);
-        const boxTitle = label === ORCHESTRATOR_LABEL ? params.label : `${params.label} [${label}]`;
+        const boxTitle =
+          label === ORCHESTRATOR_LABEL
+            ? params.label
+            : `${params.label} [${label}]`;
         log.box(message, { title: boxTitle });
         // only the orchestrator's final text is the run's "output" — children
         // emit their own text on report-back, which would clobber the parent's
@@ -529,7 +741,10 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       // Moonshot, and OpenRouter (see pullfrog-baseline/opencode-*.log).
       // guard against NaN/Infinity — a single poison value would make the
       // running total un-recoverable for the rest of the session.
-      if (typeof event.part?.cost === "number" && Number.isFinite(event.part.cost)) {
+      if (
+        typeof event.part?.cost === "number" &&
+        Number.isFinite(event.part.cost)
+      ) {
         accumulatedCostUsd += event.part.cost;
       }
       if (currentStepId === stepId) {
@@ -542,24 +757,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       const toolId = event.part?.callID;
       if (!toolName || !toolId) {
         log.info(
-          `» tool_use event missing toolName or toolId: ${JSON.stringify(event).substring(0, 500)}`
+          `» tool_use event missing toolName or toolId: ${JSON.stringify(event).substring(0, 500)}`,
         );
         return;
-      }
-
-      // suspend the activity watchdog across the tool call (issue #760).
-      // for `task` tool dispatches the injected plugin already reverbs
-      // child.stdout chunks, so this is mostly defense-in-depth there;
-      // for non-task MCP tools (checkout_pr, etc.) the suspend is the
-      // only thing keeping a multi-minute fetch from tripping the 300s
-      // spawn-level idle timer. gate by part status: bus-envelope
-      // re-dispatches at line 915 fire only on terminal statuses
-      // (`completed`/`error`) and never produce a paired `tool_result`,
-      // so suspending on those would leak the watchdog open until the
-      // 15min auto-resume — exactly the issue #12 zombie-run window.
-      const status = event.part?.state?.status;
-      if (status !== "completed" && status !== "error") {
-        suspendActivity();
       }
 
       // when the orchestrator dispatches a subagent via the `task` tool, push
@@ -590,7 +790,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
           pendingTaskDispatches.push(dispatch);
           log.info(
             `» dispatching subagent: ${dispatchedLabel}` +
-              (taskInput.subagent_type ? ` (subagent_type=${taskInput.subagent_type})` : "")
+              (taskInput.subagent_type
+                ? ` (subagent_type=${taskInput.subagent_type})`
+                : ""),
           );
         }
       } else {
@@ -616,10 +818,15 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       timerFor(label).markToolCall();
       const inputFormatted = formatJsonValue(event.part?.state?.input || {});
       const toolCallLine =
-        inputFormatted !== "{}" ? `» ${toolName}(${inputFormatted})` : `» ${toolName}()`;
+        inputFormatted !== "{}"
+          ? `» ${toolName}(${inputFormatted})`
+          : `» ${toolName}()`;
       log.info(withLabel(label, toolCallLine));
 
-      if (event.part?.state?.status === "completed" && event.part.state.output) {
+      if (
+        event.part?.state?.status === "completed" &&
+        event.part.state.output
+      ) {
         log.debug(withLabel(label, `  output: ${event.part.state.output}`));
       }
       // surface tool errors at info level. opencode emits tool parts at
@@ -628,7 +835,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       // branch the only signal in the user's logs is `» <tool>(...)` with
       // no indication the call failed.
       if (event.part?.state?.status === "error") {
-        log.info(withLabel(label, `» tool call failed: ${event.part.state.error}`));
+        log.info(
+          withLabel(label, `» tool call failed: ${event.part.state.error}`),
+        );
       }
 
       // agent's explicit MCP report_progress takes priority over todo tracking
@@ -643,7 +852,6 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       }
     },
     tool_result: (event: OpenCodeToolResultEvent) => {
-      resumeActivity();
       const toolId = event.part?.callID || event.tool_id;
       const state = event.part?.state;
       const status = state?.status ?? event.status ?? "unknown";
@@ -671,9 +879,12 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       if (taskDispatchByCallID.size > 0 || pendingTaskDispatches.length > 0) {
         if (toolId && taskDispatchByCallID.has(toolId)) {
           const dispatch = taskDispatchByCallID.get(toolId);
-          if (dispatch) emitSubagentFinished(dispatch, status, payload, "exact");
+          if (dispatch)
+            emitSubagentFinished(dispatch, status, payload, "exact");
         } else {
-          const callIDIsKnownNonTask = toolId ? knownNonTaskCallIDs.has(toolId) : false;
+          const callIDIsKnownNonTask = toolId
+            ? knownNonTaskCallIDs.has(toolId)
+            : false;
           if (!callIDIsKnownNonTask && pendingTaskDispatches.length > 0) {
             const dispatch = pendingTaskDispatches[0]!;
             emitSubagentFinished(dispatch, status, payload, "fifo");
@@ -686,12 +897,14 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
         if (toolStartTime) {
           const toolDuration = performance.now() - toolStartTime;
           toolCallTimings.delete(toolId);
-          const stepContext = currentStepId ? ` (step=${currentStepType || "unknown"})` : "";
+          const stepContext = currentStepId
+            ? ` (step=${currentStepType || "unknown"})`
+            : "";
           log.debug(
             withLabel(
               label,
-              `» ${params.label} tool_result${stepContext}: id=${toolId}, status=${status}, duration=${Math.round(toolDuration)}ms`
-            )
+              `» ${params.label} tool_result${stepContext}: id=${toolId}, status=${status}, duration=${Math.round(toolDuration)}ms`,
+            ),
           );
           if (payload) {
             log.debug(withLabel(label, `  output: ${payload}`));
@@ -700,14 +913,19 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
             log.info(
               withLabel(
                 label,
-                `» tool call took ${(toolDuration / 1000).toFixed(1)}s - may indicate network latency`
-              )
+                `» tool call took ${(toolDuration / 1000).toFixed(1)}s - may indicate network latency`,
+              ),
             );
           }
         }
       }
       if (status === "error") {
-        log.info(withLabel(label, `» tool call failed: ${payload ?? "(no error message)"}`));
+        log.info(
+          withLabel(
+            label,
+            `» tool call failed: ${payload ?? "(no error message)"}`,
+          ),
+        );
       } else if (payload) {
         log.debug(withLabel(label, `tool output: ${payload}`));
       }
@@ -719,7 +937,10 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       // unless we capture this event the run is reported as success.
       agentErrorEvent = event;
       const errorName = event.error?.name || "unknown";
-      const errorMessage = event.error?.data?.message || event.error?.name || JSON.stringify(event);
+      const errorMessage =
+        event.error?.data?.message ||
+        event.error?.name ||
+        JSON.stringify(event);
       log.info(`» ${params.label} error event: ${errorName}: ${errorMessage}`);
     },
     result: async (event: OpenCodeResultEvent) => {
@@ -727,7 +948,7 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       const duration = event.stats?.duration_ms || 0;
       const toolCalls = event.stats?.tool_calls || 0;
       log.info(
-        `» ${params.label} result: status=${status}, duration=${duration}ms, tool_calls=${toolCalls}`
+        `» ${params.label} result: status=${status}, duration=${duration}ms, tool_calls=${toolCalls}`,
       );
 
       if (event.status === "error") {
@@ -736,7 +957,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
         // the final `result` event only carries input_tokens/output_tokens and
         // no cache breakdown — accumulatedTokens (summed across step_finish
         // events) is strictly more accurate, so we prefer it unconditionally.
-        log.info(`» run complete: tool_calls=${toolCalls}, duration=${duration}ms`);
+        log.info(
+          `» run complete: tool_calls=${toolCalls}, duration=${duration}ms`,
+        );
 
         if (
           (accumulatedTokens.input > 0 ||
@@ -804,7 +1027,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
             pendingTaskDispatches.push(dispatch);
             log.info(
               `» dispatching subagent: ${dispatchedLabel}` +
-                (taskInput.subagent_type ? ` (subagent_type=${taskInput.subagent_type})` : "")
+                (taskInput.subagent_type
+                  ? ` (subagent_type=${taskInput.subagent_type})`
+                  : ""),
             );
           }
           return;
@@ -891,15 +1116,13 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       // wrapper would grow unbounded for multi-lens Reviews and previously
       // crashed the wrapper with RangeError at ~1 GiB. see issue #680.
       retain: "none",
-      // suspend the spawn-level idle watchdog across MCP tool calls (issue
-      // #760). bracketed by suspendActivity()/resumeActivity() in the
-      // tool_use/tool_result handlers above, bounded by
-      // MAX_TOOL_CALL_SUSPENSION_MS in activity.ts. the injected plugin
-      // (action/agents/opencodePlugin.ts) re-emits subagent
-      // `message.part.updated` events on opencode's stdout, so subagent
-      // dispatches keep marking child.stdout activity as well — defense
-      // in depth (verified empirically in PR #634, ~3.3 plugin events/sec).
-      isPausedExternally: isActivitySuspended,
+      // NB: we used to pass `isPausedExternally: isSubagentInFlight` to suspend
+      // the activity timer during subagent dispatches. unnecessary now that
+      // our injected plugin (action/agents/opencodePlugin.ts) re-emits
+      // subagent `message.part.updated` events on opencode's stdout — those
+      // arrive at child.stdout here, fire updateActivity(), and reset
+      // lastActivityTime naturally. verified empirically in PR #634
+      // (~3.3 plugin events/sec during a typical subagent run).
       onStdout: async (chunk) => {
         const text = chunk.toString();
         output.append(text);
@@ -933,7 +1156,7 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
                 ? ` (waiting for ${activeToolCalls} tool call${activeToolCalls > 1 ? "s" : ""})`
                 : ` (${params.label} may be processing internally - LLM calls, planning, etc.)`;
             log.info(
-              `» no activity for ${(timeSinceLastActivity / 1000).toFixed(1)}s${toolCallInfo} (${eventCount} events processed so far)`
+              `» no activity for ${(timeSinceLastActivity / 1000).toFixed(1)}s${toolCallInfo} (${eventCount} events processed so far)`,
             );
           }
           markActivity();
@@ -941,7 +1164,7 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
           const handler = handlers[event.type as keyof typeof handlers];
           if (!handler) {
             log.info(
-              `» ${params.label} event (unhandled): type=${event.type}, data=${JSON.stringify(event).substring(0, 500)}`
+              `» ${params.label} event (unhandled): type=${event.type}, data=${JSON.stringify(event).substring(0, 500)}`,
             );
             continue;
           }
@@ -949,7 +1172,7 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
             await handler(event as never);
           } catch (err) {
             log.info(
-              `» ${params.label} handler for type=${event.type} threw: ${err instanceof Error ? err.message : String(err)}`
+              `» ${params.label} handler for type=${event.type} threw: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
         }
@@ -965,7 +1188,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
         if (match) {
           lastProviderError = match.label;
           diagnostic.lastProviderError = match.label;
-          log.info(`» provider error detected (${match.label}): ${match.excerpt}`);
+          log.info(
+            `» provider error detected (${match.label}): ${match.excerpt}`,
+          );
         } else {
           log.debug(trimmed);
         }
@@ -993,7 +1218,7 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       for (const dispatch of [...pendingTaskDispatches]) {
         const elapsed = performance.now() - dispatch.startedAt;
         log.info(
-          `» subagent finished (inferred at run-end): ${dispatch.label} (≤${(elapsed / 1000).toFixed(1)}s) — no matching tool_result observed; subagent reply likely arrived via assistant message`
+          `» subagent finished (inferred at run-end): ${dispatch.label} (≤${(elapsed / 1000).toFixed(1)}s) — no matching tool_result observed; subagent reply likely arrived via assistant message`,
         );
       }
       pendingTaskDispatches.length = 0;
@@ -1002,7 +1227,7 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
 
     const duration = performance.now() - startTime;
     log.info(
-      `» ${params.label} completed in ${Math.round(duration)}ms with exit code ${result.exitCode}`
+      `» ${params.label} completed in ${Math.round(duration)}ms with exit code ${result.exitCode}`,
     );
 
     if (eventCount === 0) {
@@ -1038,7 +1263,7 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
         stdoutSnapshot ||
         `unknown error - no output from OpenCode CLI${errorContext}`;
       log.error(
-        `${params.label} exited with code ${result.exitCode}${errorContext}: ${errorMessage}`
+        `${params.label} exited with code ${result.exitCode}${errorContext}: ${errorMessage}`,
       );
       log.debug(`stdout: ${stdoutSnapshot.substring(0, 500)}`);
       log.debug(`stderr: ${stderrSnapshot.substring(0, 500)}`);
@@ -1063,7 +1288,9 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
       const errorEvent: OpenCodeErrorEvent = agentErrorEvent;
       const errorName = errorEvent.error?.name || "agent error";
       const errorMessage =
-        errorEvent.error?.data?.message || errorEvent.error?.name || JSON.stringify(errorEvent);
+        errorEvent.error?.data?.message ||
+        errorEvent.error?.name ||
+        JSON.stringify(errorEvent);
       return {
         success: false,
         output: finalOutput || output.toString(),
@@ -1078,7 +1305,8 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
     const duration = performance.now() - startTime;
     const errorMessage = error instanceof Error ? error.message : String(error);
     const isActivityTimeout =
-      error instanceof SpawnTimeoutError && error.code === SPAWN_ACTIVITY_TIMEOUT_CODE;
+      error instanceof SpawnTimeoutError &&
+      error.code === SPAWN_ACTIVITY_TIMEOUT_CODE;
 
     const stderrContext = recentStderr.slice(-10).join("\n");
     const diagnosis = lastProviderError
@@ -1088,15 +1316,19 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
         : `${eventCount} events were processed before the hang`;
 
     log.info(
-      `» ${params.label} ${isActivityTimeout ? "hung" : "failed"} after ${(duration / 1000).toFixed(1)}s: ${errorMessage}`
+      `» ${params.label} ${isActivityTimeout ? "hung" : "failed"} after ${(duration / 1000).toFixed(1)}s: ${errorMessage}`,
     );
     log.info(`» diagnosis: ${diagnosis}`);
     if (stderrContext)
       log.info(
-        `» recent stderr (last ${Math.min(recentStderr.length, 10)} lines):\n${stderrContext}`
+        `» recent stderr (last ${Math.min(recentStderr.length, 10)} lines):\n${stderrContext}`,
       );
 
-    const body = formatAgentHangBody({ diagnostic, isHang: isActivityTimeout, errorMessage });
+    const body = formatAgentHangBody({
+      diagnostic,
+      isHang: isActivityTimeout,
+      errorMessage,
+    });
     return {
       success: false,
       output: finalOutput || output.toString(),
@@ -1110,11 +1342,12 @@ async function runOpenCode(params: RunParams): Promise<AgentResult> {
 
 export const opencode = agent({
   name: "opencode",
-  install: installCli,
+  install: installOpencodeCli,
   run: async (ctx) => {
-    const cliPath = await installCli();
+    const cliPath = await installOpencodeCli();
 
-    const rawModel = ctx.payload.proxyModel ?? ctx.resolvedModel ?? autoSelectModel(cliPath);
+    const rawModel =
+      ctx.payload.proxyModel ?? ctx.resolvedModel ?? autoSelectModel(cliPath);
 
     // bedrock route: opencode's `amazon-bedrock` provider expects the model
     // string in `amazon-bedrock/<bedrock-id>` form. the bare AWS model ID
@@ -1130,22 +1363,56 @@ export const opencode = agent({
     // only belongs in `resolveAgent`.
     const bedrockModelId = process.env[BEDROCK_MODEL_ID_ENV]?.trim();
     const isBedrockRoute =
-      rawModel !== undefined && bedrockModelId !== undefined && bedrockModelId === rawModel;
-    let model = rawModel;
-    if (isBedrockRoute) {
-      model = `amazon-bedrock/${rawModel}`;
-    }
-    const vertexModel = resolveVertexOpenCodeModel(rawModel);
-    if (vertexModel) {
-      model = vertexModel;
+      rawModel !== undefined &&
+      bedrockModelId !== undefined &&
+      bedrockModelId === rawModel;
+    let model = isBedrockRoute ? `amazon-bedrock/${rawModel}` : rawModel;
+
+    // parse a trailing variant suffix like "/high" or "/medium" from the
+    // model string. opencode treats variant as a separate --variant CLI flag,
+    // not part of the model ID — e.g. "github-copilot/gpt-5.4/high" becomes
+    // model="github-copilot/gpt-5.4" with variant="high".
+    let variant: string | undefined;
+    if (model) {
+      const parts = model.split("/");
+      const last = parts[parts.length - 1];
+      if (
+        parts.length >= 3 &&
+        last &&
+        ["none", "minimal", "low", "medium", "high", "xhigh"].includes(last)
+      ) {
+        variant = parts.pop()!;
+        model = parts.join("/");
+      }
     }
 
     const homeEnv = {
       HOME: ctx.tmpdir,
       XDG_CONFIG_HOME: join(ctx.tmpdir, ".config"),
+      XDG_DATA_HOME: join(ctx.tmpdir, ".local", "share"),
     };
 
-    mkdirSync(join(homeEnv.XDG_CONFIG_HOME, "opencode"), { recursive: true });
+    // inject a pre-obtained GitHub Copilot token into opencode's auth store so
+    // the github-copilot provider can skip the OAuth device flow. the token is
+    // a Copilot API bearer token (not a PAT) that authenticates against
+    // api.githubcopilot.com — obtained via OAuth device flow or exchanged from
+    // a PAT at https://api.github.com/copilot_internal/v2/token.
+    const copilotToken = process.env.COPILOT_TOKEN;
+    if (copilotToken) {
+      const authDir = join(homeEnv.XDG_DATA_HOME, "opencode");
+      mkdirSync(authDir, { recursive: true });
+      writeFileSync(
+        join(authDir, "auth.json"),
+        JSON.stringify({
+          "github-copilot": {
+            type: "oauth",
+            refresh: copilotToken,
+            access: copilotToken,
+            expires: 0,
+          },
+        }),
+      );
+    }
 
     // drop our bus-event surfacing plugin into opencode's global config dir
     // (which we've redirected to the per-run tmpdir via XDG_CONFIG_HOME).
@@ -1154,12 +1421,50 @@ export const opencode = agent({
     // `ConfigPlugin.load(dir)`), so this lands in the loader without any
     // config wiring. critically: this MUST be inside the tmpdir, never the
     // user's repo working tree — see AGENTS.md.
-    const opencodePluginDir = join(homeEnv.XDG_CONFIG_HOME, "opencode", "plugin");
+    const opencodePluginDir = join(
+      homeEnv.XDG_CONFIG_HOME,
+      "opencode",
+      "plugin",
+    );
     mkdirSync(opencodePluginDir, { recursive: true });
     writeFileSync(
       join(opencodePluginDir, PULLFROG_OPENCODE_PLUGIN_FILENAME),
-      PULLFROG_OPENCODE_PLUGIN_SOURCE
+      PULLFROG_OPENCODE_PLUGIN_SOURCE,
     );
+
+    if (process.env.CROFAI_API_KEY) {
+      const CROFAI_PLUGIN_FILENAME = "crofai.mjs";
+      const apiBase = process.env.CROFAI_BASE_URL || "https://crof.ai/v1";
+      writeFileSync(
+        join(opencodePluginDir, CROFAI_PLUGIN_FILENAME),
+        [
+          `const API_BASE = ${JSON.stringify(apiBase)};`,
+          `const PROVIDER_ID = "crofai";`,
+          `export async function CrofaiPlugin() {`,
+          `  return {`,
+          `    config: async (config) => {`,
+          `      config.provider = config.provider || {};`,
+          `      config.provider.crofai = { id: PROVIDER_ID, name: "CrofAI", npm: "@ai-sdk/openai-compatible", api: API_BASE, env: ["CROFAI_API_KEY"] };`,
+          `    },`,
+          `    provider: { id: PROVIDER_ID, models: async () => {`,
+          `      try {`,
+          `        const res = await fetch(API_BASE + "/models", { signal: AbortSignal.timeout(10000) });`,
+          `        if (!res.ok) return {};`,
+          `        const body = await res.json();`,
+          `        if (!body.data) return {};`,
+          `        const models = {};`,
+          `        for (const m of body.data) {`,
+          `          models[m.id] = { id: m.id, providerID: PROVIDER_ID, name: m.name || m.id, api: { id: m.id, url: API_BASE, npm: "@ai-sdk/openai-compatible" }, capabilities: { temperature: true, reasoning: !!(m.reasoning_effort || m.custom_reasoning), toolcall: true, input: { text: true }, output: { text: true } }, status: "active" };`,
+          `        }`,
+          `        return models;`,
+          `      } catch { return {}; }`,
+          `    }},`,
+          `    auth: { provider: PROVIDER_ID, loader: async () => ({ apiKey: process.env.CROFAI_API_KEY }), methods: [{ provider: PROVIDER_ID, label: "CrofAI API Key", type: "api" }] },`,
+          `  };`,
+          `}`,
+        ].join("\n"),
+      );
+    }
 
     const agentBrowserVersion = getDevDependencyVersion("agent-browser");
     addSkill({
@@ -1171,20 +1476,13 @@ export const opencode = agent({
 
     installBundledSkills({ home: homeEnv.HOME });
 
-    // materialize CODEX_AUTH_JSON (Pullfrog-stored Codex subscription
-    // credential) into the runner's REAL $HOME/.local/share/opencode/auth.json
-    // so OpenCode's CodexAuthPlugin picks it up and routes openai requests
-    // through the ChatGPT subscription instead of needing OPENAI_API_KEY.
-    // see action/utils/codexHome.ts and wiki/codex-auth.md.
-    const codexAuth = installCodexAuth();
-
     // base args shared between initial run and continue runs
     const baseArgs = ["run", "--format", "json", "--print-logs"];
+    if (variant) baseArgs.push("--variant", variant);
 
     // OPENCODE_PERMISSION has absolute highest precedence (merged after managed/MDM configs).
     // external_directory gates ALL native filesystem tools (Read, Write, Edit, Glob, Grep, etc.)
     // for paths outside the project root. last-match-wins: deny everything, then allow /tmp.
-    // auth.json sits under real $HOME (outside /tmp/*), so deny-default protects it.
     const permissionOverride = JSON.stringify({
       external_directory: { "*": "deny", "/tmp/*": "allow" },
     });
@@ -1198,31 +1496,11 @@ export const opencode = agent({
         process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GEMINI_API_KEY,
     };
 
-    if (codexAuth) {
-      // point OpenCode at the real-home XDG dir so it reads auth.json from
-      // where we wrote it (not the tmpdir-redirected default).
-      env.XDG_DATA_HOME = codexAuth.xdgDataHome;
-      // remove OPENAI_API_KEY so OpenCode's provider merge unambiguously
-      // picks the OAuth path. with both set, the merge order in opencode
-      // makes the effective key ambiguous.
-      delete env.OPENAI_API_KEY;
-      // hand the post-hook everything it needs to detect + persist refresh.
-      // post-hook runs in a fresh node process, so we have to ferry apiToken
-      // explicitly — env is preserved across main/post but our run-context
-      // JWT is computed at runtime and not put in env. see action/entryPost.ts.
-      core.saveState(
-        "codex_writeback",
-        JSON.stringify({
-          apiToken: ctx.apiToken,
-          authPath: codexAuth.authPath,
-          originalRefresh: codexAuth.originalRefresh,
-        })
-      );
-    }
-
     const repoDir = process.cwd();
 
-    log.debug(`» starting Pullfrog (OpenCode): ${cliPath} ${baseArgs.join(" ")}`);
+    log.debug(
+      `» starting Pullfrog (OpenCode): ${cliPath} ${baseArgs.join(" ")}`,
+    );
     log.debug(`» working directory: ${repoDir}`);
 
     const runParams = {
@@ -1236,10 +1514,36 @@ export const opencode = agent({
       onToolUse: ctx.onToolUse,
     };
 
-    const result = await runOpenCode({
-      ...runParams,
-      args: [...baseArgs, ctx.instructions.full],
-    });
+    // retry the entire opencode run when the Copilot API rate-limits us,
+    // which happens frequently on shared plans (~50 req/mo on Free). the
+    // error surfaces in opencode's stderr as a 429 / rate-limit log line
+    // and propagates through AgentResult.error on run failure.
+    const RATE_LIMIT_RETRIES = 3;
+    const RATE_LIMIT_PATTERN = /\brate[_ ]limit|429|too many requests|retry/i;
+
+    async function runWithRateLimitRetry(
+      fn: () => Promise<AgentResult>,
+    ): Promise<AgentResult> {
+      for (let attempt = 1; attempt <= RATE_LIMIT_RETRIES; attempt++) {
+        const r = await fn();
+        if (r.success || !r.error || !RATE_LIMIT_PATTERN.test(r.error))
+          return r;
+        if (attempt >= RATE_LIMIT_RETRIES) return r;
+        const delay = Math.min(1_000 * 2 ** attempt, 15_000);
+        log.info(
+          `» rate limited (attempt ${attempt}/${RATE_LIMIT_RETRIES}), retrying in ${delay}ms...`,
+        );
+        await sleep(delay);
+      }
+      return { success: false, error: "rate limit retry exhausted" };
+    }
+
+    const result = await runWithRateLimitRetry(() =>
+      runOpenCode({
+        ...runParams,
+        args: [...baseArgs, ctx.instructions.full],
+      }),
+    );
 
     // post-run retry loop aggregates usage across the initial run + every
     // resume, so the caller sees the whole session — not just the final
@@ -1250,15 +1554,16 @@ export const opencode = agent({
       ctx,
       initialResult: result,
       initialUsage: result.usage,
-      reflectionPrompt:
-        ctx.toolState.learningsFilePath && shouldRunReflection(ctx.toolState.selectedMode)
-          ? buildLearningsReflectionPrompt(ctx.toolState.learningsFilePath)
-          : undefined,
+      reflectionPrompt: ctx.toolState.learningsFilePath
+        ? buildLearningsReflectionPrompt(ctx.toolState.learningsFilePath)
+        : undefined,
       resume: async (c) =>
-        runOpenCode({
-          ...runParams,
-          args: [...baseArgs, "--continue", c.prompt],
-        }),
+        runWithRateLimitRetry(() =>
+          runOpenCode({
+            ...runParams,
+            args: [...baseArgs, "--continue", c.prompt],
+          }),
+        ),
     });
   },
 });
